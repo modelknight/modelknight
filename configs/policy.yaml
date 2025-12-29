@@ -1,0 +1,24 @@
+rules:
+  - id: block-jailbreak-keywords
+    description: Block obvious jailbreak attempts
+    applies_to: prompt
+    action: block
+    priority: 10
+    when:
+      any:
+        - type: keywords
+          field: text
+          values:
+            - ignore previous instructions
+            - reveal system prompt
+            - bypass safety
+  - id: block-cc
+    description: Block CC digits on responses only
+    applies_to: response
+    action: block
+    priority: 5
+    when:
+      any:
+        - type: regex
+          field: text
+          pattern: \b\d{13,19}\b
