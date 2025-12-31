@@ -1,5 +1,5 @@
 use crate::compile::{compile_rule, CompiledRule};
-use crate::policy::{PolicyFile, Rule};
+use crate::policy::{PiiConfig, PolicyFile, Rule};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -12,6 +12,7 @@ struct Inner {
     policy_path: PathBuf,
     rules: Vec<Rule>,
     compiled: Vec<CompiledRule>,
+    pii: PiiConfig,
 }
 
 impl RuleStore {
@@ -20,6 +21,7 @@ impl RuleStore {
             .await
             .unwrap_or_else(|_| "rules: []\n".to_string());
 
+        // PolicyFile has #[serde(default)] on pii, so older YAML without pii works.
         let policy: PolicyFile = serde_yaml::from_str(&raw)?;
         let compiled = compile_all(&policy.rules)?;
 
@@ -28,6 +30,7 @@ impl RuleStore {
                 policy_path,
                 rules: policy.rules,
                 compiled,
+                pii: policy.pii, // NEW
             })),
         })
     }
@@ -83,6 +86,11 @@ impl RuleStore {
     pub async fn compiled_snapshot(&self) -> Vec<CompiledRule> {
         self.inner.read().await.compiled.clone()
     }
+
+    // NEW: allow API layer to read pii settings
+    pub async fn pii_config(&self) -> PiiConfig {
+        self.inner.read().await.pii.clone()
+    }
 }
 
 fn compile_all(rules: &[Rule]) -> anyhow::Result<Vec<CompiledRule>> {
@@ -100,13 +108,14 @@ async fn rebuild_and_persist(w: &mut Inner) -> anyhow::Result<()> {
     // Compile first — if it fails (bad regex), we don’t persist a broken policy
     w.compiled = compile_all(&w.rules)?;
 
+    // Persist rules + pii
     let policy = PolicyFile {
         rules: w.rules.clone(),
+        pii: w.pii.clone(),
     };
     let yaml = serde_yaml::to_string(&policy)?;
 
     tokio::fs::create_dir_all(w.policy_path.parent().unwrap_or(std::path::Path::new("./"))).await?;
-
     tokio::fs::write(&w.policy_path, yaml).await?;
     Ok(())
 }

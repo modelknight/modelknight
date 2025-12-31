@@ -1,0 +1,63 @@
+rules:
+  # -----------------------------
+  # Stage 1: Prompt guardrails
+  # -----------------------------
+  - id: block-jailbreak-keywords
+    description: Block obvious jailbreak attempts
+    applies_to: prompt
+    action: block
+    priority: 10
+    when:
+      any:
+        - type: keywords
+          field: text
+          values:
+            - ignore previous instructions
+            - reveal system prompt
+            - bypass safety
+
+  # -----------------------------
+  # Stage 1: Response blocking
+  # (demonstrates rule precedence vs PII)
+  # -----------------------------
+  - id: block-credit-card-response
+    description: Block responses containing long digit sequences
+    applies_to: response
+    action: block
+    priority: 5
+    when:
+      any:
+        - type: regex
+          field: text
+          pattern: \b\d{13,19}\b
+
+# ---------------------------------
+# Stage 2a: OSS PII Redaction
+# ---------------------------------
+pii:
+  enabled: true
+
+  # Apply redaction to both prompts and responses
+  applies_to: both
+
+  # redact = allow request, but mutate output_text
+  # off    = disable PII stage entirely
+  mode: redact
+
+  # All detected PII becomes exactly this string
+  redaction_token: "REDACTED"
+
+  # Enable regex-based detectors
+  detectors:
+    email: true
+    ip: true
+    credit_card: true
+    phone: true
+
+  # Guardrail against abuse / very large payloads
+  max_bytes: 32768
+
+  # IMPORTANT:
+  # false = do NOT return raw matched substrings
+  # true  = return entity_type + offsets + original text
+  include_findings: false

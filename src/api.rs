@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::compile::{CompiledMatch, CompiledRule};
 use crate::{
     pii_regex::PiiRegexDetector,
-    policy::{Action, AppliesTo, EvalRequest, EvalResponse, Kind, Rule},
+    policy::{Action, AppliesTo, EvalRequest, EvalResponse, Kind, Rule, PiiMode},
     store::RuleStore,
 };
 
@@ -98,25 +98,67 @@ async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> i
         return (StatusCode::OK, Json(resp)).into_response();
     }
 
-    // Stage 2a: full masking (OSS)
-    let (masked, findings) = st.pii_regex.full_mask(&req.text);
+    // Stage 2a: policy-driven PII redaction (OSS)
+    let pii_cfg = st.store.pii_config().await;
 
-    let (output_text, pii) = if findings.is_empty() {
-        (None, None)
-    } else {
-        let pii_entities = findings
+    // basic payload guard
+    if req.text.as_bytes().len() > pii_cfg.max_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "text exceeds max_bytes policy",
+        )
+            .into_response();
+    }
+
+    let mut output_text: Option<String> = None;
+    let mut pii: Option<Vec<crate::policy::PiiEntity>> = None;
+
+    let pii_should_run = pii_cfg.enabled
+        && applies(&pii_cfg.applies_to, &req.kind)
+        && matches!(pii_cfg.mode, PiiMode::Redact);
+
+    if pii_should_run {
+        // Detect all PII types
+        let all_findings = st.pii_regex.detect(&req.text);
+
+        // Filter based on enabled detectors
+        let findings: Vec<_> = all_findings
             .into_iter()
-            .map(|f| crate::policy::PiiEntity {
-                entity_type: format!("{:?}", f.pii_type),
-                start: f.start,
-                end: f.end,
-                score: 1.0,
-                text: f.text,
+            .filter(|f| match f.pii_type {
+                crate::pii_regex::PiiType::Email => pii_cfg.detectors.email,
+                crate::pii_regex::PiiType::Ip => pii_cfg.detectors.ip,
+                crate::pii_regex::PiiType::CreditCard => pii_cfg.detectors.credit_card,
+                crate::pii_regex::PiiType::Phone => pii_cfg.detectors.phone,
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        (Some(masked), Some(pii_entities))
-    };
+        if !findings.is_empty() {
+            // Apply redactions for filtered findings only
+            let mut masked = req.text.clone();
+            for f in findings.iter().rev() {
+                masked.replace_range(f.start..f.end, &pii_cfg.redaction_token);
+            }
+
+            output_text = Some(masked);
+
+            if pii_cfg.include_findings {
+                let pii_entities = findings
+                    .into_iter()
+                    .map(|f| crate::policy::PiiEntity {
+                        entity_type: format!("{:?}", f.pii_type),
+                        start: f.start,
+                        end: f.end,
+                        score: 1.0,
+                        text: f.text, // only included when include_findings=true
+                    })
+                    .collect::<Vec<_>>();
+                pii = Some(pii_entities);
+            } else {
+                // safer default: don't return raw substrings
+                pii = None;
+            }
+        }
+    }
 
     let resp = EvalResponse {
         request_id,

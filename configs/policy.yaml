@@ -22,3 +22,17 @@ rules:
         - type: regex
           field: text
           pattern: \b\d{13,19}\b
+
+# Disable Stage 2 PII redaction
+pii:
+  enabled: true
+  applies_to: both
+  mode: redact
+  redaction_token: "REDACTED"
+  detectors:
+    email: true
+    ip: true
+    credit_card: false
+    phone: false
+  max_bytes: 32768
+  include_findings: false

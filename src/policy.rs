@@ -4,6 +4,10 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PolicyFile {
     pub rules: Vec<Rule>,
+
+    /// Stage 2a: regex-based PII redaction (OSS)
+    #[serde(default)]
+    pub pii: PiiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -16,12 +20,74 @@ pub struct Rule {
     pub when: When,            // OR list
 }
 
+/// Stage 2a config
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PiiConfig {
+    pub enabled: bool,
+    pub applies_to: AppliesTo, // prompt|response|both
+    pub mode: PiiMode,         // redact|off (future: block/report)
+    pub redaction_token: String,
+    pub detectors: PiiDetectors,
+    pub max_bytes: usize,
+    pub include_findings: bool,
+}
+
+impl Default for PiiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            applies_to: AppliesTo::Both,
+            mode: PiiMode::Redact,
+            redaction_token: "REDACTED".to_string(),
+            detectors: PiiDetectors::default(),
+            max_bytes: 32 * 1024,
+            include_findings: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiiMode {
+    Redact,
+    Off,
+}
+
+impl Default for PiiMode {
+    fn default() -> Self {
+        PiiMode::Redact
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PiiDetectors {
+    pub email: bool,
+    pub ip: bool,
+    pub credit_card: bool,
+    pub phone: bool,
+}
+
+impl Default for PiiDetectors {
+    fn default() -> Self {
+        Self {
+            email: false,
+            ip: false,
+            credit_card: false,
+            phone: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PiiEntity {
     pub entity_type: String,
     pub start: usize,
     pub end: usize,
     pub score: f32,
+
+    // ⚠️ Consider removing this in default mode to avoid leaking raw PII back.
+    // We'll keep it in the struct, but control whether it's populated via include_findings.
     pub text: String,
 }
 
@@ -91,4 +157,3 @@ pub enum Kind {
     Prompt,
     Response,
 }
-
