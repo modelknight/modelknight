@@ -1,16 +1,16 @@
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::State,
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{get, post},
     Json, Router,
 };
 use uuid::Uuid;
 
 use crate::compile::{CompiledMatch, CompiledRule};
 use crate::{
-    pii_regex::PiiRegexDetector,
-    policy::{Action, AppliesTo, EvalRequest, EvalResponse, Kind, Rule, PiiMode},
+    pii_regex::{PiiRegexDetector, PiiType},
+    policy::{Action, AppliesTo, EvalRequest, EvalResponse, Kind, PiiMode, PolicyFile},
     store::RuleStore,
 };
 
@@ -23,59 +23,49 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        // CRUD
-        .route("/v1/rules", get(list_rules).post(create_rule))
-        .route(
-            "/v1/rules/:id",
-            get(get_rule).put(update_rule).delete(delete_rule),
-        )
-        // Evaluate
+        // Data plane
         .route("/v1/eval", post(eval))
+        // Control plane: policy is YAML source of truth
+        .route("/admin/v1/policy", get(get_policy_yaml))
+        .route("/admin/v1/policy/apply", post(apply_policy_yaml))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
-async fn list_rules(State(st): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(st.store.list_rules().await))
-}
+// -----------------------------
+// Control plane (YAML policy)
+// -----------------------------
 
-async fn get_rule(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match st.store.get_rule(&id).await {
-        Some(rule) => (StatusCode::OK, Json(rule)).into_response(),
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
-    }
-}
+async fn get_policy_yaml(State(st): State<AppState>) -> impl IntoResponse {
+    let policy = st.store.get_policy().await;
 
-async fn create_rule(State(st): State<AppState>, Json(rule): Json<Rule>) -> impl IntoResponse {
-    match st.store.create_rule(rule).await {
-        Ok(_) => (StatusCode::CREATED, "created").into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    }
-}
-
-async fn update_rule(
-    State(st): State<AppState>,
-    Path(id): Path<String>,
-    Json(rule): Json<Rule>,
-) -> impl IntoResponse {
-    match st.store.update_rule(&id, rule).await {
-        Ok(_) => (StatusCode::OK, "updated").into_response(),
-        Err(e) if e.to_string().contains("not found") => {
-            (StatusCode::NOT_FOUND, "not found").into_response()
+    match serde_yaml::to_string(&policy) {
+        Ok(yaml) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, "text/yaml; charset=utf-8".parse().unwrap());
+            (StatusCode::OK, headers, yaml).into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn apply_policy_yaml(State(st): State<AppState>, body: String) -> impl IntoResponse {
+    // Parse YAML -> PolicyFile
+    let policy: PolicyFile = match serde_yaml::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid yaml: {e}")).into_response(),
+    };
+
+    // store.apply_policy() compiles/validates before swapping & persisting
+    match st.store.apply_policy(policy).await {
+        Ok(_) => (StatusCode::OK, "applied").into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
-async fn delete_rule(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match st.store.delete_rule(&id).await {
-        Ok(_) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(e) if e.to_string().contains("not found") => {
-            (StatusCode::NOT_FOUND, "not found").into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    }
-}
+// -----------------------------
+// Data plane (eval)
+// -----------------------------
 
 async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> impl IntoResponse {
     let request_id = req.request_id.unwrap_or_else(Uuid::new_v4);
@@ -98,10 +88,10 @@ async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> i
         return (StatusCode::OK, Json(resp)).into_response();
     }
 
-    // Stage 2a: policy-driven PII redaction (OSS)
+    // Stage 2a: policy-driven PII redaction
     let pii_cfg = st.store.pii_config().await;
 
-    // basic payload guard
+    // payload guard
     if req.text.as_bytes().len() > pii_cfg.max_bytes {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -121,19 +111,18 @@ async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> i
         // Detect all PII types
         let all_findings = st.pii_regex.detect(&req.text);
 
-        // Filter based on enabled detectors
+        // Filter by enabled detectors
         let findings: Vec<_> = all_findings
             .into_iter()
             .filter(|f| match f.pii_type {
-                crate::pii_regex::PiiType::Email => pii_cfg.detectors.email,
-                crate::pii_regex::PiiType::Ip => pii_cfg.detectors.ip,
-                crate::pii_regex::PiiType::CreditCard => pii_cfg.detectors.credit_card,
-                crate::pii_regex::PiiType::Phone => pii_cfg.detectors.phone,
+                PiiType::Email => pii_cfg.detectors.email,
+                PiiType::Ip => pii_cfg.detectors.ip,
+                PiiType::CreditCard => pii_cfg.detectors.credit_card,
+                PiiType::Phone => pii_cfg.detectors.phone,
             })
             .collect();
 
         if !findings.is_empty() {
-            // Apply redactions for filtered findings only
             let mut masked = req.text.clone();
             for f in findings.iter().rev() {
                 masked.replace_range(f.start..f.end, &pii_cfg.redaction_token);
@@ -149,13 +138,10 @@ async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> i
                         start: f.start,
                         end: f.end,
                         score: 1.0,
-                        text: f.text, // only included when include_findings=true
+                        text: f.text,
                     })
                     .collect::<Vec<_>>();
                 pii = Some(pii_entities);
-            } else {
-                // safer default: don't return raw substrings
-                pii = None;
             }
         }
     }
@@ -171,6 +157,10 @@ async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> i
 
     (StatusCode::OK, Json(resp)).into_response()
 }
+
+// -----------------------------
+// Stage 1 matching helpers
+// -----------------------------
 
 fn evaluate_stage1(
     rules: &[CompiledRule],

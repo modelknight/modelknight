@@ -30,10 +30,51 @@ impl RuleStore {
                 policy_path,
                 rules: policy.rules,
                 compiled,
-                pii: policy.pii, // NEW
+                pii: policy.pii,
             })),
         })
     }
+
+    // -------------------------
+    // Policy-level operations
+    // -------------------------
+
+    /// Returns the currently active full policy (rules + pii).
+    pub async fn get_policy(&self) -> PolicyFile {
+        let r = self.inner.read().await;
+        PolicyFile {
+            rules: r.rules.clone(),
+            pii: r.pii.clone(),
+        }
+    }
+
+    /// Applies a full policy atomically:
+    /// - validate + compile rules first (fail fast)
+    /// - swap state (rules + compiled + pii)
+    /// - persist to disk
+    pub async fn apply_policy(&self, policy: PolicyFile) -> anyhow::Result<()> {
+        // Compile first — if it fails (bad regex), we don’t mutate state or persist.
+        let compiled = compile_all(&policy.rules)?;
+
+        let mut w = self.inner.write().await;
+        w.rules = policy.rules;
+        w.pii = policy.pii;
+        w.compiled = compiled;
+
+        persist_locked(&w).await
+    }
+
+    /// Convenience setter for Stage 2 config (optional).
+    /// Internally persists the full policy.
+    pub async fn set_pii_config(&self, pii: PiiConfig) -> anyhow::Result<()> {
+        let mut policy = self.get_policy().await;
+        policy.pii = pii;
+        self.apply_policy(policy).await
+    }
+
+    // -------------------------
+    // Rule CRUD (Stage 1)
+    // -------------------------
 
     pub async fn list_rules(&self) -> Vec<Rule> {
         self.inner.read().await.rules.clone()
@@ -87,7 +128,6 @@ impl RuleStore {
         self.inner.read().await.compiled.clone()
     }
 
-    // NEW: allow API layer to read pii settings
     pub async fn pii_config(&self) -> PiiConfig {
         self.inner.read().await.pii.clone()
     }
@@ -107,7 +147,10 @@ fn compile_all(rules: &[Rule]) -> anyhow::Result<Vec<CompiledRule>> {
 async fn rebuild_and_persist(w: &mut Inner) -> anyhow::Result<()> {
     // Compile first — if it fails (bad regex), we don’t persist a broken policy
     w.compiled = compile_all(&w.rules)?;
+    persist_locked(w).await
+}
 
+async fn persist_locked(w: &Inner) -> anyhow::Result<()> {
     // Persist rules + pii
     let policy = PolicyFile {
         rules: w.rules.clone(),
