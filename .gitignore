@@ -29,3 +29,5 @@ tarpaulin-report.html
 cobertura.xml
 *.profraw
 *.profdata
+
+tools/venv

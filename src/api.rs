@@ -26,8 +26,7 @@ pub fn router(state: AppState) -> Router {
         // Data plane
         .route("/v1/eval", post(eval))
         // Control plane: policy is YAML source of truth
-        .route("/admin/v1/policy", get(get_policy_yaml))
-        .route("/admin/v1/policy/apply", post(apply_policy_yaml))
+        .route("/admin/v1/policy", get(get_policy_yaml).post(apply_policy_yaml))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
@@ -87,7 +86,19 @@ async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> i
         };
         return (StatusCode::OK, Json(resp)).into_response();
     }
-
+    // Stage 1.5: semantic similarity (char n-gram)
+    let semantic = st.store.semantic_snapshot().await;
+    if let Some((case_id, score, example)) = crate::semantic::evaluate(&semantic, &req.kind, &req.text) {
+        let resp = EvalResponse {
+            request_id,
+            action: semantic.action.clone(),
+            matched_rule: Some(format!("semantic:{}", case_id)),
+            reason: Some(format!("similarity={:.3} to example: {}", score, example)),
+            output_text: None,
+            pii: None,
+        };
+        return (StatusCode::OK, Json(resp)).into_response();
+    }
     // Stage 2a: policy-driven PII redaction
     let pii_cfg = st.store.pii_config().await;
 
@@ -100,51 +111,7 @@ async fn eval(State(st): State<AppState>, Json(mut req): Json<EvalRequest>) -> i
             .into_response();
     }
 
-    let mut output_text: Option<String> = None;
-    let mut pii: Option<Vec<crate::policy::PiiEntity>> = None;
-
-    let pii_should_run = pii_cfg.enabled
-        && applies(&pii_cfg.applies_to, &req.kind)
-        && matches!(pii_cfg.mode, PiiMode::Redact);
-
-    if pii_should_run {
-        // Detect all PII types
-        let all_findings = st.pii_regex.detect(&req.text);
-
-        // Filter by enabled detectors
-        let findings: Vec<_> = all_findings
-            .into_iter()
-            .filter(|f| match f.pii_type {
-                PiiType::Email => pii_cfg.detectors.email,
-                PiiType::Ip => pii_cfg.detectors.ip,
-                PiiType::CreditCard => pii_cfg.detectors.credit_card,
-                PiiType::Phone => pii_cfg.detectors.phone,
-            })
-            .collect();
-
-        if !findings.is_empty() {
-            let mut masked = req.text.clone();
-            for f in findings.iter().rev() {
-                masked.replace_range(f.start..f.end, &pii_cfg.redaction_token);
-            }
-
-            output_text = Some(masked);
-
-            if pii_cfg.include_findings {
-                let pii_entities = findings
-                    .into_iter()
-                    .map(|f| crate::policy::PiiEntity {
-                        entity_type: format!("{:?}", f.pii_type),
-                        start: f.start,
-                        end: f.end,
-                        score: 1.0,
-                        text: f.text,
-                    })
-                    .collect::<Vec<_>>();
-                pii = Some(pii_entities);
-            }
-        }
-    }
+    let (output_text, pii) = evaluate_stage2a(&st.pii_regex, &pii_cfg, &req);
 
     let resp = EvalResponse {
         request_id,
@@ -180,6 +147,70 @@ fn evaluate_stage1(
     }
     (Action::Allow, None, None)
 }
+
+// -----------------------------
+// Stage 2a PII redaction
+// -----------------------------
+
+fn evaluate_stage2a(
+    detector: &PiiRegexDetector,
+    pii_cfg: &crate::policy::PiiConfig,
+    req: &EvalRequest,
+) -> (Option<String>, Option<Vec<crate::policy::PiiEntity>>) {
+    let pii_should_run = pii_cfg.enabled
+        && applies(&pii_cfg.applies_to, &req.kind)
+        && matches!(pii_cfg.mode, PiiMode::Redact);
+
+    if !pii_should_run {
+        return (None, None);
+    }
+
+    // Detect all PII types
+    let all_findings = detector.detect(&req.text);
+
+    // Filter by enabled detectors
+    let findings: Vec<_> = all_findings
+        .into_iter()
+        .filter(|f| match f.pii_type {
+            PiiType::Email => pii_cfg.detectors.email,
+            PiiType::Ip => pii_cfg.detectors.ip,
+            PiiType::CreditCard => pii_cfg.detectors.credit_card,
+            PiiType::Phone => pii_cfg.detectors.phone,
+        })
+        .collect();
+
+    if findings.is_empty() {
+        return (None, None);
+    }
+
+    // Apply redactions
+    let mut masked = req.text.clone();
+    for f in findings.iter().rev() {
+        masked.replace_range(f.start..f.end, &pii_cfg.redaction_token);
+    }
+
+    let pii = if pii_cfg.include_findings {
+        let pii_entities = findings
+            .into_iter()
+            .map(|f| crate::policy::PiiEntity {
+                entity_type: format!("{:?}", f.pii_type),
+                start: f.start,
+                end: f.end,
+                score: 1.0,
+                text: f.text,
+            })
+            .collect::<Vec<_>>();
+        Some(pii_entities)
+    } else {
+        None
+    };
+
+    (Some(masked), pii)
+}
+
+// -----------------------------
+// Matching helpers
+// -----------------------------
 
 fn applies(applies_to: &AppliesTo, kind: &Kind) -> bool {
     match (applies_to, kind) {

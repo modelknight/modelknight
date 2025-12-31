@@ -3,7 +3,7 @@ rules:
   description: Block obvious jailbreak attempts
   applies_to: prompt
   action: block
-  priority: 10
+  priority: 1
   when:
     any:
     - type: keywords
@@ -11,9 +11,8 @@ rules:
       values:
       - ignore previous instructions
       - reveal system prompt
-      - bypass safety
-- id: block-cc
-  description: Block CC digits on responses only
+- id: block-cc-response
+  description: Block credit-card-like digits in responses
   applies_to: response
   action: block
   priority: 5
@@ -29,8 +28,25 @@ pii:
   redaction_token: REDACTED
   detectors:
     email: true
-    ip: false
-    credit_card: false
+    ip: true
+    credit_card: true
     phone: true
   max_bytes: 32768
   include_findings: false
+semantic:
+  enabled: true
+  applies_to: prompt
+  action: block
+  threshold: 0.3
+  cases:
+  - id: jailbreak
+    description: Jailbreak-like prompts
+    examples:
+    - text: override safety mechanisms
+      embedding: null
+    - text: work around safety restrictions
+      embedding: null
+    - text: bypass safety policies
+      embedding: null
+  ngram_min: 4
+  ngram_max: 6

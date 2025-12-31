@@ -2,6 +2,7 @@ mod api;
 mod compile;
 mod pii_regex;
 mod policy;
+mod semantic;
 mod store;
 //mod evaluator; // if you extracted stage1 evaluator into its own module
 

@@ -1,0 +1,52 @@
+rules:
+  - id: block-jailbreak-keywords
+    description: Block obvious jailbreak attempts
+    applies_to: prompt
+    action: block
+    priority: 1
+    when:
+      any:
+        - type: keywords
+          field: text
+          values:
+            - ignore previous instructions
+            - reveal system prompt
+
+  - id: block-cc-response
+    description: Block credit-card-like digits in responses
+    applies_to: response
+    action: block
+    priority: 5
+    when:
+      any:
+        - type: regex
+          field: text
+          pattern: "\\b\\d{13,19}\\b"
+
+pii:
+  enabled: true
+  applies_to: both
+  mode: redact
+  redaction_token: "REDACTED"
+  include_findings: false
+  max_bytes: 32768
+  detectors:
+    email: true
+    ip: true
+    credit_card: true
+    phone: true
+
+semantic:
+  enabled: true
+  applies_to: prompt
+  action: block
+  threshold: 0.3
+  ngram_min: 4
+  ngram_max: 6
+  cases:
+    - id: jailbreak
+      description: Jailbreak-like prompts
+      examples:
+        - "override safety mechanisms"
+        - "work around safety restrictions"
+        - "bypass safety policies"
