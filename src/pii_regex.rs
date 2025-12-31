@@ -1,22 +1,13 @@
 use regex::Regex;
 
+pub const REDACTION_TOKEN: &str = "REDACTED";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PiiType {
     Email,
     Ip,
     CreditCard,
     Phone,
-}
-
-impl PiiType {
-    pub fn token(&self) -> &'static str {
-        match self {
-            PiiType::Email => "[EMAIL]",
-            PiiType::Ip => "[IP]",
-            PiiType::CreditCard => "[CREDIT_CARD]",
-            PiiType::Phone => "[PHONE]",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,10 +33,9 @@ impl PiiRegexDetector {
             re_email: Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")?,
             // IPv4 candidate, validate range after match
             re_ipv4: Regex::new(r"\b(\d{1,3}\.){3}\d{1,3}\b")?,
-            // 13-19 digits, optional spaces or dashes
-            // We'll normalize and Luhn-check
+            // 13-19 digits, optional spaces or dashes; we normalize and Luhn-check
             re_cc_digits: Regex::new(r"\b(?:\d[ -]?){13,19}\b")?,
-            // very rough phone (improve later). you can add country-specific later.
+            // very rough phone (improve later)
             re_phone: Regex::new(r"\b(?:\+?\d[\d -]{7,}\d)\b")?,
         })
     }
@@ -90,7 +80,7 @@ impl PiiRegexDetector {
             }
         }
 
-        // PHONE (heuristic: avoid re-masking CC already found; we’ll dedupe later anyway)
+        // PHONE (heuristic)
         for m in self.re_phone.find_iter(text) {
             let s = &text[m.start()..m.end()];
             let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -105,11 +95,15 @@ impl PiiRegexDetector {
             }
         }
 
-        // sort + merge overlaps (prefer longer match, then stable)
+        // sort by start asc, and for same start prefer longer match (end desc)
         out.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+
+        // remove overlaps so replacement offsets remain valid
         merge_overlaps(out)
     }
 
+    /// Returns masked output + findings.
+    /// Masking is always the literal string "REDACTED".
     pub fn full_mask(&self, text: &str) -> (String, Vec<Finding>) {
         let findings = self.detect(text);
         let masked = apply_replacements(text, &findings);
@@ -121,13 +115,12 @@ impl PiiRegexDetector {
 fn apply_replacements(input: &str, findings: &[Finding]) -> String {
     let mut s = input.to_string();
     for f in findings.iter().rev() {
-        s.replace_range(f.start..f.end, f.pii_type.token());
+        s.replace_range(f.start..f.end, REDACTION_TOKEN);
     }
     s
 }
 
-/// Remove overlaps so we don’t corrupt offsets.
-/// Rule: keep the first match, discard any later match that overlaps it.
+/// Rule: keep the first match, discard later matches that overlap it.
 fn merge_overlaps(sorted: Vec<Finding>) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
     let mut last_end: usize = 0;
@@ -138,7 +131,6 @@ fn merge_overlaps(sorted: Vec<Finding>) -> Vec<Finding> {
             out.push(f);
             continue;
         }
-        // if overlaps previous kept range, skip
         if f.start < last_end {
             continue;
         }
@@ -191,45 +183,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn masks_email_fully() {
+    fn redacts_email_as_redacted() {
         let det = PiiRegexDetector::new().unwrap();
         let (out, findings) = det.full_mask("contact me at eugene@example.com please");
-        assert!(out.contains("[EMAIL]"));
+        assert!(out.contains(REDACTION_TOKEN));
         assert!(!out.contains("eugene@example.com"));
         assert!(findings.iter().any(|f| f.pii_type == PiiType::Email));
     }
 
     #[test]
-    fn masks_ipv4_fully() {
+    fn redacts_ipv4_as_redacted() {
         let det = PiiRegexDetector::new().unwrap();
         let (out, findings) = det.full_mask("ip is 192.168.45.23 ok");
-        assert!(out.contains("[IP]"));
+        assert!(out.contains(REDACTION_TOKEN));
         assert!(!out.contains("192.168.45.23"));
         assert!(findings.iter().any(|f| f.pii_type == PiiType::Ip));
     }
 
     #[test]
-    fn masks_credit_card_only_if_luhn_valid() {
+    fn redacts_credit_card_only_if_luhn_valid() {
         let det = PiiRegexDetector::new().unwrap();
 
         let (out1, f1) = det.full_mask("card 4111111111111111");
-        assert!(out1.contains("[CREDIT_CARD]"));
+        assert!(out1.contains(REDACTION_TOKEN));
         assert!(f1.iter().any(|f| f.pii_type == PiiType::CreditCard));
 
-        // invalid luhn -> should not mask as credit card
+        // invalid luhn -> should not redact as credit card
         let (out2, f2) = det.full_mask("card 4111111111111112");
-        assert!(!out2.contains("[CREDIT_CARD]"));
+        assert!(!out2.contains(REDACTION_TOKEN)); // only token would come from other detectors
         assert!(f2.iter().all(|f| f.pii_type != PiiType::CreditCard));
     }
 
     #[test]
-    fn masks_multiple_types_and_preserves_text() {
+    fn redacts_multiple_types_with_same_token() {
         let det = PiiRegexDetector::new().unwrap();
         let input = "Email e@example.com IP 8.8.8.8 CC 4111-1111-1111-1111";
-        let (out, _) = det.full_mask(input);
+        let (out, findings) = det.full_mask(input);
 
-        assert!(out.contains("[EMAIL]"));
-        assert!(out.contains("[IP]"));
-        assert!(out.contains("[CREDIT_CARD]"));
+        // all replaced with the same literal token
+        assert!(out.contains(REDACTION_TOKEN));
+        assert!(!out.contains("e@example.com"));
+        assert!(!out.contains("8.8.8.8"));
+        assert!(!out.contains("4111-1111-1111-1111"));
+
+        assert!(findings.iter().any(|f| f.pii_type == PiiType::Email));
+        assert!(findings.iter().any(|f| f.pii_type == PiiType::Ip));
+        assert!(findings.iter().any(|f| f.pii_type == PiiType::CreditCard));
     }
 }
